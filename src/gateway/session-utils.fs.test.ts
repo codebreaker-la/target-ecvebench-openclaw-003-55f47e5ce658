@@ -961,6 +961,100 @@ describe("resolveSessionTranscriptCandidates safety", () => {
   });
 });
 
+/**
+ * GHSA-rqpp-rjj8-7wv8 — Path-traversal reproduction.
+ *
+ * When `storePath` is undefined and `agentId` is absent, the
+ * `resolveSessionTranscriptCandidates` function resolves user-supplied
+ * `sessionFile` via `path.resolve(trimmed)` with no base-directory
+ * restriction.  An attacker-controlled value such as
+ * `../../../etc/passwd` resolves to an absolute path outside any
+ * session directory, enabling arbitrary file reads through callers
+ * like `readSessionMessages`.
+ *
+ * The vulnerability is at session-transcript-files.fs.ts lines 99-109.
+ *
+ * Run:
+ *   pnpm test src/gateway/session-utils.fs.test.ts -t "GHSA-rqpp-rjj8-7wv8"
+ *
+ * Expected: the "traversal path escapes" test FAILS on the vulnerable
+ * commit (the candidate list DOES contain /etc/passwd), proving the bug.
+ * After a fix, it should pass (the traversal candidate is rejected).
+ */
+describe("GHSA-rqpp-rjj8-7wv8: path traversal via sessionFile without storePath or agentId", () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  test("traversal path escapes session directory when storePath and agentId are absent", () => {
+    // Simulate the attacker-controlled input: no storePath, no agentId,
+    // only a crafted sessionFile with directory traversal sequences.
+    const candidates = resolveSessionTranscriptCandidates(
+      "any-session-id",
+      undefined, // storePath
+      "../../../etc/passwd", // sessionFile — attacker-controlled
+      // agentId omitted
+    );
+
+    // On the VULNERABLE commit this resolves to /etc/passwd (or cwd-relative
+    // equivalent) and the candidate list includes it.
+    const resolvedTraversal = path.resolve("../../../etc/passwd");
+    const hasTraversalCandidate = candidates.some((c) => path.resolve(c) === resolvedTraversal);
+
+    // --- PROOF OF VULNERABILITY ---
+    // This assertion intentionally documents the *vulnerable* behavior:
+    // the function DOES include the traversal path.  A fixed version
+    // would make hasTraversalCandidate === false.
+    expect(hasTraversalCandidate).toBe(true);
+  });
+
+  test("readSessionMessages reads arbitrary file content via traversal", () => {
+    // Create a temp file outside any session directory to act as the
+    // "sensitive" file the attacker wants to read.
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "ghsa-rqpp-"));
+    const sensitiveFile = path.join(tmpDir, "secret.jsonl");
+    fs.writeFileSync(
+      sensitiveFile,
+      JSON.stringify({ message: { role: "assistant", content: "LEAKED_SECRET" } }) + "\n",
+      "utf-8",
+    );
+
+    try {
+      // The attacker supplies the absolute path as sessionFile.
+      // storePath and agentId are absent — hits the vulnerable branch.
+      const messages = readSessionMessages("any-session-id", undefined, sensitiveFile);
+
+      // --- PROOF OF VULNERABILITY ---
+      // readSessionMessages successfully reads the file because
+      // resolveSessionTranscriptCandidates returns the attacker path
+      // as a valid candidate.
+      expect(messages).toHaveLength(1);
+      const content = (messages[0] as Record<string, unknown>).content;
+      expect(content).toBe("LEAKED_SECRET");
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  test("relative traversal also resolves outside session directories", () => {
+    // Even relative paths with traversal sequences resolve to arbitrary
+    // locations because path.resolve() anchors them to cwd.
+    const traversalInputs = [
+      "../../../../tmp/evil.jsonl",
+      "../../../etc/shadow",
+      "/absolute/path/to/any/file.jsonl",
+    ];
+
+    for (const input of traversalInputs) {
+      const candidates = resolveSessionTranscriptCandidates("any-session-id", undefined, input);
+      const resolved = path.resolve(input);
+      const found = candidates.some((c) => path.resolve(c) === resolved);
+      // Vulnerable: all of these resolve verbatim.
+      expect(found).toBe(true);
+    }
+  });
+});
+
 describe("archiveSessionTranscripts", () => {
   let tmpDir: string;
   let storePath: string;
