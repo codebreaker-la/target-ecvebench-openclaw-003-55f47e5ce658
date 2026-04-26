@@ -47,15 +47,17 @@ describe("GHSA-rqpp-rjj8-7wv8: path traversal via sessionFile", () => {
       /* agentId */ undefined,
     );
 
-    // The vulnerable code resolves this to an absolute path pointing at /etc/passwd
-    // (or wherever the traversal leads from the current working directory).
+    // The vulnerable code resolves this to an absolute path pointing outside
+    // any session directory — wherever the traversal leads from the CWD.
     const resolvedMalicious = path.resolve(maliciousSessionFile);
 
     // BUG: the candidate list contains the traversal-resolved path.
     expect(candidates).toContain(resolvedMalicious);
 
-    // The resolved path escapes any session directory — it points at /etc/passwd.
-    expect(resolvedMalicious).toBe("/etc/passwd");
+    // The resolved path escapes any plausible session directory.
+    // It should NOT contain a sessions-directory component.
+    expect(resolvedMalicious).not.toContain("sessions");
+    expect(resolvedMalicious).toMatch(/\/etc\/passwd$/);
   });
 
   // ------------------------------------------------------------------
